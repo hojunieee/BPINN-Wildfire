@@ -37,7 +37,7 @@ def level_set_function(x, y, x0=0.0, y0=0.0, offset=0.0):
         u[:, :, 0] = torch.sqrt((X-x0)**2 + (Y-y0)**2) - offset
     return u
 
-def c_wind_obstruction_complex(t, x, y):
+def c_wind_obstruction(t, x, y):
     """
     Compute the speed constant c in the level-set equation. This constant 
     comprises both the wind speed and the fire-front speed
@@ -86,6 +86,91 @@ def c_wind_obstruction_complex(t, x, y):
         s[mask] = 1e-9
         w_x[mask] = 1e-9
         w_y[mask] = 1e-9
+    return s, w_x, w_y
+
+def c_wind_obstruction_complex(t, x, y):
+    """
+    Complex, smooth, time-varying wind field with evolving vortices.
+    Fully compatible with BPINN single or multiple time steps.
+    Returns tensors of shape [Nx, Ny, Nt].
+    """
+    with torch.no_grad():
+        # Ensure float tensors
+        x = x.float()
+        y = y.float()
+        t = t.float()
+        Nx, Ny, Nt = len(x), len(y), len(t)
+
+        # Meshgrid for spatial domain only (not time)
+        X, Y = torch.meshgrid(x, y, indexing='ij')
+
+        # Allocate outputs
+        s = torch.zeros((Nx, Ny, Nt), dtype=torch.float32)
+        w_x = torch.zeros((Nx, Ny, Nt), dtype=torch.float32)
+        w_y = torch.zeros((Nx, Ny, Nt), dtype=torch.float32)
+
+        # Firefront spread rate (terrain dependent)
+        s_base = 0.15 + 0.1 * torch.sin(2 * np.pi * X) * torch.cos(2 * np.pi * Y)
+        s_base = torch.clamp(s_base, 0.05, 0.3)
+
+        def smooth_step(t, center, width=0.05):
+            return torch.sigmoid((t - center) / width)
+
+        for i in range(Nt):
+            t_scalar = float(t[i])
+            t_t = torch.tensor(t_scalar, dtype=torch.float32)
+
+            # Smooth transition between temporal regimes
+            w1 = smooth_step(t_t, 0.2) * (1 - smooth_step(t_t, 0.4))
+            w2 = smooth_step(t_t, 0.4) * (1 - smooth_step(t_t, 0.7))
+            w3 = smooth_step(t_t, 0.7)
+
+            scale = 1.0 + 0.5 * w1 - 0.4 * w2 + 0.2 * w3
+            phase_shift = 0.3 * w1 - 0.5 * w2 + 1.0 * w3
+
+            # Global oscillatory wind field
+            vx_global = scale * (1.0 + 0.25 * torch.sin(20.0 * Y + 40.0 * (t_t + phase_shift)))
+            vy_global = scale * 0.3 * torch.cos(20.0 * X - 35.0 * (t_t + phase_shift))
+
+            # Vortices
+            cx1, cy1 = 0.55, 0.55
+            cx2, cy2 = 0.35, 0.35
+            dx1, dy1 = X - cx1, Y - cy1
+            dx2, dy2 = X - cx2, Y - cy2
+            r1 = torch.sqrt(dx1**2 + dy1**2) + 1e-6
+            r2 = torch.sqrt(dx2**2 + dy2**2) + 1e-6
+
+            amp1 = 0.5 * (0.5 + 0.5 * torch.sin(2 * np.pi * (t_t / 0.6)))
+            amp2 = 0.3 * (0.5 + 0.5 * torch.cos(2 * np.pi * (t_t / 0.8)))
+
+            strength1 = amp1 * torch.exp(-r1**2 / (2 * 0.12**2))
+            strength2 = amp2 * torch.exp(-r2**2 / (2 * 0.15**2))
+            core1, core2 = 0.05, 0.06
+
+            vx_spiral1 = -strength1 * dy1 / (r1**2 + core1**2)
+            vy_spiral1 =  strength1 * dx1 / (r1**2 + core1**2)
+            vx_spiral2 =  strength2 * dy2 / (r2**2 + core2**2)
+            vy_spiral2 = -strength2 * dx2 / (r2**2 + core2**2)
+
+            vx = vx_global + 0.3 * (vx_spiral1 + vx_spiral2)
+            vy = vy_global + 0.3 * (vy_spiral1 + vy_spiral2)
+
+            # Assign per-time slice
+            s[:, :, i] = s_base
+            w_x[:, :, i] = vx
+            w_y[:, :, i] = vy
+
+        # Terrain obstructions
+        X3, Y3, _ = torch.meshgrid(x, y, t, indexing='ij')
+        mask = (
+            ((X3 > -0.2) & (X3 < 0.3) & (Y3 > 0.2) & (Y3 < 0.8))
+            | ((X3 > 0.7) & (X3 < 0.8) & (Y3 > 0.4) & (Y3 < 0.5))
+            | ((X3 > 0.7) & (X3 < 0.8) & (Y3 > 0.6) & (Y3 < 0.7))
+        )
+        s[mask] = 1e-9
+        w_x[mask] = 1e-9
+        w_y[mask] = 1e-9
+
     return s, w_x, w_y
 
 

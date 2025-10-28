@@ -26,8 +26,20 @@ import time
 
 from dataset import DatasetScaler, level_set_function, c_wind_obstruction_complex
 from pinn import PINN_Bayesian
-    
-train_model = False
+
+# Directory setup
+import os
+trialID = "BPINN_vortex_wind"
+os.makedirs("results", exist_ok=True)
+os.makedirs("results/models", exist_ok=True)
+os.makedirs("results/figures", exist_ok=True)
+
+save_file = f'results/models/{trialID}.pt'
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
+
+train_model = True
 n_epochs = 16000
 learning_rate = 1e-3
 predictive_cost = True
@@ -42,7 +54,7 @@ x_max = 1.0
 y_min = 0.0
 y_max = 1.0
 t_min = 0.0
-t_max = 0.1
+t_max = 1.0
 x_mid = 0.5
 y_mid = 0.5
 t0 = 0.0
@@ -254,6 +266,99 @@ wx_test = wx_test.reshape((Nx, Ny, Nt)).cpu()
 wy_test = wy_test.reshape((Nx, Ny, Nt)).cpu()
 s_test = s_test.reshape((Nx, Ny, Nt)).cpu()
 
+
+# Load ground-truth from level-set simulation
+data = np.load("results/levelset_reference.npz")
+psi_gt = data["psi"]
+
+# Compute burned region masks
+pred_mask = (u_mean < 0).astype(np.uint8)
+true_mask = (psi_gt < 0).astype(np.uint8)
+
+# Compute Jaccard per time step
+jaccard_scores = []
+for t in range(Nt):
+    inter = np.logical_and(pred_mask[:,:,t], true_mask[:,:,t]).sum()
+    union = np.logical_or(pred_mask[:,:,t], true_mask[:,:,t]).sum()
+    jaccard = inter / union if union > 0 else 1.0
+    jaccard_scores.append(jaccard)
+
+print("Mean IoU (Jaccard):", np.mean(jaccard_scores))
+np.savez(f"results/{trialID}_iou_curve.npz", jaccard=jaccard_scores)
+
+plt.figure()
+plt.plot(np.linspace(t_min, t_max, Nt), jaccard_scores, 'r-', linewidth=2)
+plt.xlabel("Time")
+plt.ylabel("Jaccard Index (IoU)")
+plt.title("BPINN vs. Level-Set Ground Truth")
+plt.grid(True)
+plt.savefig(f"results/figures/{trialID}_IoU_curve.png", dpi=200)
+plt.show()
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import numpy as np
+
+# --- Load ground truth (already done above) ---
+data = np.load("results/levelset_reference.npz")
+psi_gt = data["psi"]
+
+# --- Plot comparison like Fig.5 (3×4 grid) ---
+fig, axes = plt.subplots(4, 3, figsize=(10, 10), sharex=True, sharey=True)
+fig.suptitle("Zero-Level Contours: BPINN (red) vs Level-Set (blue)", fontsize=14)
+
+i, j = 0, 0
+for t_idx in range(0, Nt, Nt // 11):
+    ax = axes[i, j]
+
+    # BPINN prediction contour (red)
+    ax.contour(x_test[:, :, t_idx], y_test[:, :, t_idx],
+               u_mean[:, :, t_idx], levels=[0], colors='red', linewidths=2.0)
+
+    # Level-set ground truth contour (pink)
+    ax.contour(x_test[:, :, t_idx], y_test[:, :, t_idx],
+               psi_gt[:, :, t_idx], levels=[0], colors='blue', linewidths=1.5, linestyles='--')
+
+    # Wind quiver (optional)
+    grd = 3
+    ax.quiver(
+        x_test[::grd, ::grd, t_idx],
+        y_test[::grd, ::grd, t_idx],
+        wx_test[::grd, ::grd, t_idx],
+        wy_test[::grd, ::grd, t_idx],
+        color='black',
+        alpha=0.6,
+        scale=20,
+        width=0.006,        
+        headwidth=3,
+        headlength=5,
+        headaxislength=5
+    )
+
+
+    # Obstacle/terrain patches (same as in Fig.5)
+    ax.add_patch(Rectangle((0.0, 0.2), 0.3, 0.6, facecolor="dodgerblue", alpha=0.3, zorder=2))
+    ax.add_patch(Rectangle((0.7, 0.4), 0.1, 0.1, facecolor="dodgerblue", alpha=0.3, zorder=2))
+    ax.add_patch(Rectangle((0.7, 0.6), 0.1, 0.1, facecolor="dodgerblue", alpha=0.3, zorder=2))
+    ax.add_patch(Rectangle((0.0, 0.0), 0.5, 1.0, facecolor="#4fc94f", alpha=0.35, zorder=0))
+    ax.add_patch(Rectangle((0.5, 0.0), 0.5, 1.0, facecolor="#c2ffc2", alpha=0.35, zorder=0))
+
+    ax.set_aspect('equal', 'box')
+    ax.set_title(f"t = {t_idx * (t_max - t_min) / Nt:.3f}")
+    ax.grid(True, alpha=0.5)
+
+    j += 1
+    if j >= 3:
+        i += 1
+        j = 0
+
+plt.tight_layout(h_pad=0.5)
+plt.subplots_adjust(top=0.93)
+plt.savefig(f"results/figures/{trialID}_BPINN_vs_LevelSet.png", dpi=300)
+plt.show()
+
+
+
 # Plots 
 fig1, ax1 = plt.subplots(4,3, figsize=(10,10), num=1, subplot_kw={"projection": "3d"})
 fig2, ax2 = plt.subplots(4,3, figsize=(10,10), num=2, subplot_kw={"projection": "3d"})
@@ -296,7 +401,19 @@ for t in range(0, Nt, Nt//11):
         
     ax5[i,j].contour(x_test[:,:,t], y_test[:,:,t], u_mean[:,:,t], 0, colors='r')
     grd = 3
-    ax5[i,j].quiver(x_test[::grd,::grd,t], y_test[::grd,::grd,t], wx_test[::grd,::grd,t], wy_test[::grd,::grd,t])
+    ax5[i, j].quiver(
+        x_test[::grd, ::grd, t],
+        y_test[::grd, ::grd, t],
+        wx_test[::grd, ::grd, t],
+        wy_test[::grd, ::grd, t],
+        color='black',
+        alpha=0.6,
+        scale=20,
+        width=0.006,        
+        headwidth=3,
+        headlength=5,
+        headaxislength=5
+        )
     # Plot the obstructions
     ax5[i,j].add_patch(Rectangle((0.0, 0.2), 0.3, 0.6, facecolor="dodgerblue", alpha=0.3, zorder=2))
     ax5[i,j].add_patch(Rectangle((0.7, 0.4), 0.1, 0.1, facecolor="dodgerblue", alpha=0.3, zorder=2))
@@ -315,19 +432,19 @@ for t in range(0, Nt, Nt//11):
         i += 1
         j = 0
     
-plt.figure(1)
-plt.tight_layout(h_pad=2.0)
+# plt.figure(1)
+# plt.tight_layout(h_pad=2.0)
 
-plt.figure(2)
-plt.tight_layout(h_pad=2.0)
+# plt.figure(2)
+# plt.tight_layout(h_pad=2.0)
     
-plt.figure(3)
-plt.tight_layout(h_pad=2.0)
+# plt.figure(3)
+# plt.tight_layout(h_pad=2.0)
     
-plt.figure(4)
-plt.tight_layout(h_pad=2.0)
+# plt.figure(4)
+# plt.tight_layout(h_pad=2.0)
 
 plt.figure(5)
 plt.tight_layout(h_pad=0.1)
-plt.savefig('readme_images/results.png', dpi=300)
+plt.savefig(f'results/figures/{trialID}_results.png', dpi=300)
 plt.show()
